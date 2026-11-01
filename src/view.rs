@@ -7,12 +7,13 @@
 //! mensaje, `enabled: false`) no ocupa lugar.
 
 use crate::Item;
+use crate::thumbs;
 use crate::rasi::{self, Color, Theme};
 use crate::text::{Font, Text};
 use disco::icon::Icons;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Rect as SkRect, Stroke, Transform};
+use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pattern, Pixmap, PixmapPaint, Rect as SkRect, SpreadMode, Stroke, Transform};
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Rect {
@@ -79,6 +80,9 @@ pub struct View {
     text: Text,
     icons: Icons,
     images: HashMap<(PathBuf, u32), Option<Pixmap>>,
+    /// las miniaturas de las fotos, según llegan de los hilos (thumbs.rs);
+    /// sin entrada: todavía no está
+    thumbs: HashMap<String, Option<Pixmap>>,
     show_icons: bool,
     /// el ancho del monitor: los % de rofi son de la pantalla
     mon_w: f32,
@@ -122,7 +126,21 @@ impl View {
             theme.add(e);
         }
         let show_icons = theme.config("show-icons").map_or(apps, |v| rasi::boolean(&v));
-        View { theme, text: Text::new(), icons: Icons::new(), images: HashMap::new(), show_icons, mon_w: 1920.0 }
+        View { theme, text: Text::new(), icons: Icons::new(), images: HashMap::new(), thumbs: HashMap::new(), show_icons, mon_w: 1920.0 }
+    }
+
+    /// Llegó la miniatura de una foto.
+    pub fn put_thumb(&mut self, name: String, pix: Option<Pixmap>) {
+        self.thumbs.insert(name, pix);
+    }
+
+    /// El alto de un ícono de ancho `cw`: cuadrado, lo que pida el theme hasta
+    /// su lugar; o, si es una foto que llena la celda (la cuadrícula de
+    /// wallpapers), 16:9 y recortada para que todas queden parejas.
+    fn icon_h(&self, path: &[String], state: Option<&str>, em: f32, cw: f32, st: &State, item: Option<usize>) -> (f32, bool) {
+        let want = self.get(path, state, "size").map_or(em * 1.2, |v| rasi::dist(&v, em, self.mon_w));
+        let photo = item.and_then(|i| st.items[i].icon.as_deref()).is_some_and(thumbs::is_photo);
+        if photo && want >= cw { ((cw * 9.0 / 16.0).round(), true) } else { (want.min(cw), false) }
     }
 
     fn get(&self, path: &[String], state: Option<&str>, prop: &str) -> Option<String> {
@@ -254,7 +272,7 @@ impl View {
             "text" => Text::line_height(&b.font),
             // como rofi: el ícono nunca más ancho que su lugar (las miniaturas
             // de los wallpapers piden un % de la pantalla)
-            "icon" => self.get(path, state, "size").map_or(b.font.px * 1.2, |v| rasi::dist(&v, b.font.px, self.mon_w)).min(cw),
+            "icon" => self.icon_h(path, state, b.font.px, cw, st, item).0,
             "spacer" => 0.0,
             // al medir también: la forma de la lista (columnas, renglones) se usa
             // antes de dibujar (-selected-row, el modo ventanas)
@@ -288,17 +306,25 @@ impl View {
                     }
                 }
                 "icon" => {
-                    if let Some(name) = item.and_then(|i| st.items[i].icon.clone())
-                        && let Some(icon) = self.icons.get(&name)
-                    {
-                        let side = content_h;
-                        let ix = cx + (cw - side).max(0.0) * self.get(path, state, "horizontal-align").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.5);
-                        let src: &Pixmap = &icon.pix;
-                        let k = side / src.width().max(src.height()) as f32;
-                        let (dw, dh) = (src.width() as f32 * k, src.height() as f32 * k);
-                        let t = Transform::from_row(k * s, 0.0, 0.0, k * s, (ix + (side - dw) / 2.0) * s, (cy + (side - dh) / 2.0) * s);
-                        let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
-                        p.draw_pixmap(0, 0, src.as_ref(), &paint, t, None);
+                    let Some(name) = item.and_then(|i| st.items[i].icon.clone()) else { return h };
+                    let ha = self.get(path, state, "horizontal-align").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.5);
+                    if thumbs::is_photo(&name) {
+                        let (_, fill_cell) = self.icon_h(path, state, b.font.px, cw, st, item);
+                        // el redondeo: el del ícono, o el de su elemento
+                        let radius = if b.radius > 0.0 { b.radius } else { self.boxp(&path[..path.len() - 1], state).radius };
+                        if let Some(Some(src)) = self.thumbs.get(&name) {
+                            if fill_cell {
+                                cover(p, src, Rect { x: cx, y: cy, w: cw, h: content_h }, radius, s);
+                            } else {
+                                contain(p, src, cx + (cw - content_h).max(0.0) * ha, cy, content_h, s);
+                            }
+                        } else if fill_cell {
+                            // mientras llega: su lugar, apenas marcado
+                            let tc = self.get(path, state, "text-color").and_then(|v| rasi::color(&v)).unwrap_or(Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
+                            fill(p, Rect { x: cx, y: cy, w: cw, h: content_h }, radius, Color { a: 0.08, ..tc }, s);
+                        }
+                    } else if let Some(icon) = self.icons.get(&name) {
+                        contain(p, &icon.pix, cx + (cw - content_h).max(0.0) * ha, cy, content_h, s);
                     }
                 }
                 "list" => {
@@ -487,6 +513,25 @@ impl View {
         }
         laid
     }
+}
+
+/// Una imagen entera dentro del cuadro de lado `side` en (x, y).
+fn contain(p: &mut Pixmap, src: &Pixmap, x: f32, y: f32, side: f32, s: f32) {
+    let k = side / src.width().max(src.height()) as f32;
+    let (dw, dh) = (src.width() as f32 * k, src.height() as f32 * k);
+    let t = Transform::from_row(k * s, 0.0, 0.0, k * s, (x + (side - dw) / 2.0) * s, (y + (side - dh) / 2.0) * s);
+    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+    p.draw_pixmap(0, 0, src.as_ref(), &paint, t, None);
+}
+
+/// Una foto llenando `r` (recortada al centro), con las esquinas redondas.
+fn cover(p: &mut Pixmap, src: &Pixmap, r: Rect, radius: f32, s: f32) {
+    let k = (r.w / src.width() as f32).max(r.h / src.height() as f32);
+    let (dw, dh) = (src.width() as f32 * k, src.height() as f32 * k);
+    let t = Transform::from_row(k * s, 0.0, 0.0, k * s, (r.x + (r.w - dw) / 2.0) * s, (r.y + (r.h - dh) / 2.0) * s);
+    let Some(path) = rounded(Rect { x: r.x * s, y: r.y * s, w: r.w * s, h: r.h * s }, radius * s) else { return };
+    let paint = Paint { shader: Pattern::new(src.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bicubic, 1.0, t), anti_alias: true, ..Default::default() };
+    p.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
 fn paint(c: Color) -> Paint<'static> {

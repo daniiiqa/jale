@@ -13,6 +13,7 @@ ratatui = "0.29"
 serde_json = "1"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop", "xkbcommon"] }
 tiny-skia = "0.12.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "qoi"] }
 
 [profile.release]
 lto = true

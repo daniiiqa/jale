@@ -6,11 +6,16 @@
 //!   RePág/AvPág saltan · Enter abre · Shift+Enter manda lo escrito tal cual
 //!   Ctrl+U borra todo · Ctrl+W o Ctrl+Retroceso, la última palabra · Esc cierra
 //!   el mouse: pasar elige (hover-select), clic abre, la rueda baja y sube
+//!
+//! Las fotos (los wallpapers) llegan de thumbs.rs según quedan, sin detener
+//! el menú: abre al instante y se van llenando.
 
 use crate::fuzzy;
 use crate::rasi;
+use crate::thumbs;
 use crate::view::{Laid, State, View};
 use crate::{Item, Opts, Outcome};
+use smithay_client_toolkit::reexports::calloop::channel;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -26,7 +31,7 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer::{CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer},
     },
     shell::{
         WaylandSurface,
@@ -56,7 +61,8 @@ struct App {
     /// el tamaño pedido a la superficie (px lógicos)
     size: (u32, u32),
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
+    /// con su cursor: sin uno, Hyprland no pinta ninguno sobre jale
+    pointer: Option<ThemedPointer>,
     ctrl: bool,
     shift: bool,
     alt: bool,
@@ -81,6 +87,8 @@ struct App {
     cursor_on: bool,
     /// la forma de la última vez: columnas, renglones y dónde cayó cada uno
     laid: Laid,
+    /// llegó algo (una miniatura): volver a dibujar al terminar la vuelta
+    dirty: bool,
     outcome: Option<Outcome>,
 }
 
@@ -335,9 +343,37 @@ pub fn run(items: Vec<Item>, order: Vec<f64>, opts: Opts) -> Result<Outcome, Str
         top: 0,
         cursor_on: true,
         laid: Laid::default(),
+        dirty: false,
         outcome: None,
     };
     app.filter();
+
+    // las fotos, en el orden en que se ven (las primeras, primero)
+    let mut photos: Vec<String> = Vec::new();
+    for &i in &app.matches {
+        if let Some(name) = app.items[i].icon.as_ref().filter(|n| thumbs::is_photo(n))
+            && !photos.contains(name)
+        {
+            photos.push(name.clone());
+        }
+    }
+    if !photos.is_empty() {
+        let (tx, rx) = channel::channel::<(String, Option<Pixmap>)>();
+        app.handle
+            .insert_source(rx, |ev, _, app: &mut App| {
+                if let channel::Event::Msg((name, pix)) = ev {
+                    app.view.put_thumb(name, pix);
+                    app.dirty = true;
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let tx = std::sync::Mutex::new(tx);
+        thumbs::spawn(photos, move |name, pix| {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send((name, pix));
+            }
+        });
+    }
 
     let surface = app.compositor.create_surface(&qh);
     let layer = app.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("jale"), None);
@@ -360,6 +396,9 @@ pub fn run(items: Vec<Item>, order: Vec<f64>, opts: Opts) -> Result<Outcome, Str
 
     while app.outcome.is_none() {
         event_loop.dispatch(Duration::from_millis(100), &mut app).map_err(|e| e.to_string())?;
+        if std::mem::take(&mut app.dirty) {
+            app.draw();
+        }
     }
     // que se vaya ya, antes de abrir la app o de devolver al script
     app.layer = None;
@@ -412,7 +451,8 @@ impl SeatHandler for App {
             self.keyboard = self.seat.get_keyboard_with_repeat(qh, &seat, None, self.handle.clone(), cb).ok();
         }
         if cap == Capability::Pointer && self.pointer.is_none() {
-            self.pointer = self.seat.get_pointer(qh, &seat).ok();
+            let surface = self.compositor.create_surface(qh);
+            self.pointer = self.seat.get_pointer_with_theme::<App, ()>(qh, &seat, self.shm.wl_shm(), surface, ThemeSpec::default()).ok();
         }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, _: Capability) {}
@@ -436,10 +476,15 @@ impl KeyboardHandler for App {
 }
 
 impl PointerHandler for App {
-    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+    fn pointer_frame(&mut self, conn: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for e in events {
             match e.kind {
-                PointerEventKind::Enter { .. } => self.pointer_at = Some(e.position),
+                PointerEventKind::Enter { .. } => {
+                    self.pointer_at = Some(e.position);
+                    if let Some(p) = &self.pointer {
+                        let _ = p.set_cursor(conn, CursorIcon::Default);
+                    }
+                }
                 PointerEventKind::Motion { .. } => {
                     if self.pointer_at.is_some_and(|p| (p.0 - e.position.0).hypot(p.1 - e.position.1) < 2.0) {
                         continue;

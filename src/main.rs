@@ -25,6 +25,7 @@ mod apps;
 mod fuzzy;
 mod rasi;
 mod text;
+mod thumbs;
 mod ui;
 mod view;
 mod windows;
